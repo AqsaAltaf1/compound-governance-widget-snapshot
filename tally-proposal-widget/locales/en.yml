@@ -1,0 +1,4 @@
+en:
+  theme_metadata:
+    description: "Automatically fetches and displays Tally proposal information when users paste Tally proposal URLs in posts."
+
