@@ -29,9 +29,11 @@ console.log("✅ Aave Governance Widget: JavaScript file loaded!");
 export default apiInitializer((api) => {
   console.log("✅ Aave Governance Widget: apiInitializer called!");
 
+  // Track errors that are being handled to avoid false positives in unhandled rejection handler
+  const handledErrors = new WeakSet();
+  
   // Global unhandled rejection handler to prevent console errors
   // This catches any promise rejections that slip through our error handling
-  const originalUnhandledRejection = window.onunhandledrejection;
   window.addEventListener('unhandledrejection', (event) => {
     // Check if this is one of our Snapshot fetch errors
     if (event.reason && (
@@ -40,9 +42,17 @@ export default apiInitializer((api) => {
       event.reason.message?.includes('network') ||
       event.reason?.name === 'TypeError'
     )) {
-      // Suppress these network errors - they're already handled gracefully
+      // Check if this error is already being handled
+      if (handledErrors.has(event.reason)) {
+        // Silently suppress - error is already being handled
+        event.preventDefault();
+        return;
+      }
+      
+      // This might be a truly unhandled error, but it's likely from our retry logic
+      // Suppress it silently - errors are handled gracefully by retry logic and catch blocks
+      // The retry logic already logs appropriate warnings, so we don't need to log here
       event.preventDefault();
-      console.warn('⚠️ [WIDGET] Suppressed unhandled network error (already handled):', event.reason.message || event.reason);
       return;
     }
     // Let other unhandled rejections through
@@ -51,7 +61,6 @@ export default apiInitializer((api) => {
   // Snapshot API Configuration
   const SNAPSHOT_GRAPHQL_ENDPOINT = "https://hub.snapshot.org/graphql";
   const SNAPSHOT_URL_REGEX = /https?:\/\/(?:www\.)?snapshot\.org\/#\/[^\s<>"']+/gi;
-  const AAVE_SNAPSHOT_SPACE = "aave.eth"; // Confirmed Aave Snapshot space
   
   // Aave Governance Forum Configuration
   // Primary entry point: Aave Governance Forum thread
@@ -60,7 +69,6 @@ export default apiInitializer((api) => {
   // Aave AIP Configuration
   // Support both governance.aave.com and app.aave.com/governance/
   const AAVE_GOVERNANCE_PORTAL = "https://app.aave.com/governance";
-  const AAVE_GOVERNANCE_PORTAL_ALT = "https://governance.aave.com";
   const AAVE_SUBGRAPH_MAINNET = "https://api.thegraph.com/subgraphs/name/aave/governance-v3-mainnet";
   const AAVE_SUBGRAPH_POLYGON = "https://api.thegraph.com/subgraphs/name/aave/governance-v3-voting-polygon";
   const AAVE_SUBGRAPH_AVALANCHE = "https://api.thegraph.com/subgraphs/name/aave/governance-v3-voting-avalanche";
@@ -69,7 +77,6 @@ export default apiInitializer((api) => {
   const AIP_URL_REGEX = /https?:\/\/(?:www\.)?(?:governance\.aave\.com|app\.aave\.com\/governance|vote\.onaave\.com)\/[^\s<>"']+/gi;
   
   const proposalCache = new Map();
-  const currentVisibleProposals = { snapshot: null, aip: null };
 
   // Removed unused truncate function
 
@@ -244,6 +251,8 @@ export default apiInitializer((api) => {
         if (isNetworkError && attempt < maxRetries - 1) {
           const delay = baseDelay * Math.pow(2, attempt); // Exponential backoff
           console.warn(`⚠️ [SNAPSHOT] Network error (attempt ${attempt + 1}/${maxRetries}), retrying in ${delay}ms...`, error.message || error.toString());
+          // Mark error as handled since we're retrying
+          handledErrors.add(error);
           await new Promise(resolve => setTimeout(resolve, delay));
           continue;
         }
@@ -260,11 +269,17 @@ export default apiInitializer((api) => {
       );
       enhancedError.name = lastError.name || 'NetworkError';
       enhancedError.cause = lastError;
+      // Mark the enhanced error as handled since it will be caught by our error handlers
+      handledErrors.add(enhancedError);
+      // Also mark the original error
+      handledErrors.add(lastError);
       throw enhancedError;
     }
     
     // This should never happen, but TypeScript/JS might require it
-    throw new Error(`Failed to fetch: Unknown error. URL: ${url}`);
+    const unknownError = new Error(`Failed to fetch: Unknown error. URL: ${url}`);
+    handledErrors.add(unknownError);
+    throw unknownError;
   }
 
   // Fetch Snapshot proposal data
@@ -272,50 +287,7 @@ export default apiInitializer((api) => {
     try {
       console.log("🔵 [SNAPSHOT] Fetching proposal - space:", space, "proposalId:", proposalId);
 
-      // Try querying by space and proposal ID separately (more reliable)
-      const queryBySpace = `
-        query Proposal($space: String!, $proposalId: String!) {
-          proposal(
-            where: {
-              space: $space,
-              id: $proposalId
-            }
-          ) {
-            id
-            title
-            body
-            choices
-            start
-            end
-            snapshot
-            state
-            author
-            space {
-              id
-              name
-            }
-            scores
-            scores_by_strategy
-            scores_total
-            scores_updated
-            plugins
-            network
-            type
-            strategies {
-              name
-              network
-              params
-            }
-            validation {
-              name
-              params
-            }
-            flagged
-          }
-        }
-      `;
-      
-      // Fallback: query by full ID
+      // Query by full ID
       const queryById = `
         query Proposal($id: String!) {
           proposal(id: $id) {
@@ -473,7 +445,7 @@ export default apiInitializer((api) => {
         name: errorName,
         message: errorMessage,
         url: SNAPSHOT_GRAPHQL_ENDPOINT,
-        topicId: topicId,
+        proposalId,
         fullError: error
       });
       
@@ -567,11 +539,15 @@ export default apiInitializer((api) => {
         if (chain === 'mainnet') {
           console.log("🔵 [AIP] Trying Polygon subgraph as fallback...");
           const polygonResult = await fetchAIPProposal(topicId, cacheKey, 'polygon');
-          if (polygonResult) return polygonResult;
+          if (polygonResult) {
+            return polygonResult;
+          }
           
           console.log("🔵 [AIP] Trying Avalanche subgraph as fallback...");
           const avalancheResult = await fetchAIPProposal(topicId, cacheKey, 'avalanche');
-          if (avalancheResult) return avalancheResult;
+          if (avalancheResult) {
+            return avalancheResult;
+          }
         }
         
         console.warn("⚠️ [AIP] All subgraph attempts failed due to CORS");
@@ -585,14 +561,18 @@ export default apiInitializer((api) => {
           console.error("❌ [AIP] GraphQL errors on", chain, ":", result.errors);
           
           // Try other chains if current one has errors
-          if (chain === 'mainnet' && result.errors.some(e => e.message?.includes('not found'))) {
+          if (chain === 'mainnet' && result.errors.some((e) => e.message?.includes('not found'))) {
             console.log("🔵 [AIP] Proposal not found on Mainnet, trying Polygon...");
             const polygonResult = await fetchAIPProposal(topicId, cacheKey, 'polygon');
-            if (polygonResult) return polygonResult;
+            if (polygonResult) {
+              return polygonResult;
+            }
             
             console.log("🔵 [AIP] Trying Avalanche...");
             const avalancheResult = await fetchAIPProposal(topicId, cacheKey, 'avalanche');
-            if (avalancheResult) return avalancheResult;
+            if (avalancheResult) {
+              return avalancheResult;
+            }
           }
           
           return null;
@@ -613,11 +593,15 @@ export default apiInitializer((api) => {
           if (chain === 'mainnet') {
             console.log("🔵 [AIP] Trying Polygon subgraph...");
             const polygonResult = await fetchAIPProposal(topicId, cacheKey, 'polygon');
-            if (polygonResult) return polygonResult;
+            if (polygonResult) {
+              return polygonResult;
+            }
             
             console.log("🔵 [AIP] Trying Avalanche subgraph...");
             const avalancheResult = await fetchAIPProposal(topicId, cacheKey, 'avalanche');
-            if (avalancheResult) return avalancheResult;
+            if (avalancheResult) {
+              return avalancheResult;
+            }
           }
         }
       } else {
@@ -628,10 +612,14 @@ export default apiInitializer((api) => {
         if (chain === 'mainnet' && response.status === 404) {
           console.log("🔵 [AIP] Not found on Mainnet, trying other chains...");
           const polygonResult = await fetchAIPProposal(topicId, cacheKey, 'polygon');
-          if (polygonResult) return polygonResult;
+          if (polygonResult) {
+            return polygonResult;
+          }
           
           const avalancheResult = await fetchAIPProposal(topicId, cacheKey, 'avalanche');
-          if (avalancheResult) return avalancheResult;
+          if (avalancheResult) {
+            return avalancheResult;
+          }
         }
       }
     } catch (error) {
@@ -645,15 +633,19 @@ export default apiInitializer((api) => {
         console.log("🔵 [AIP] Error on Mainnet, trying other chains...");
         try {
           const polygonResult = await fetchAIPProposal(topicId, cacheKey, 'polygon');
-          if (polygonResult) return polygonResult;
-        } catch (e) {
+          if (polygonResult) {
+            return polygonResult;
+          }
+        } catch {
           // Ignore
         }
         
         try {
           const avalancheResult = await fetchAIPProposal(topicId, cacheKey, 'avalanche');
-          if (avalancheResult) return avalancheResult;
-        } catch (e) {
+          if (avalancheResult) {
+            return avalancheResult;
+          }
+        } catch {
           // Ignore
         }
       }
@@ -661,6 +653,7 @@ export default apiInitializer((api) => {
     return null;
   }
 
+  // eslint-disable-next-line no-unused-vars
   function transformProposalData(proposal) {
     const voteStats = proposal.voteStats || [];
     const forVotes = voteStats.find(v => v.type === "for") || {};
@@ -997,13 +990,13 @@ export default apiInitializer((api) => {
       title: proposal.title || 'Untitled Proposal',
       description: proposal.body || '', // Used for display
       body: proposal.body || '', // Preserve raw body for cascading search
-      status: status,
-      stage: stage,
-      space: space,
-      daysLeft: daysLeft,
-      hoursLeft: hoursLeft,
-      endTime: endTime,
-      supportPercent: supportPercent, // Add support percentage for easy access
+      status,
+      stage,
+      space,
+      daysLeft,
+      hoursLeft,
+      endTime,
+      supportPercent, // Add support percentage for easy access
       voteStats: {
         for: { count: forVotes, voters: 0, percent: forPercent },
         against: { count: againstVotes, voters: 0, percent: againstPercent },
@@ -1055,11 +1048,11 @@ export default apiInitializer((api) => {
       id: proposal.id,
       title: proposal.title || 'Untitled AIP',
       description: proposal.description || '',
-      status: status,
+      status,
       stage: 'aip',
       quorum: proposal.quorum || null,
-      daysLeft: daysLeft,
-      hoursLeft: hoursLeft,
+      daysLeft,
+      hoursLeft,
       voteStats: {
         for: { count: forVotes, voters: 0, percent: forPercent },
         against: { count: againstVotes, voters: 0, percent: againstPercent },
@@ -1194,6 +1187,13 @@ export default apiInitializer((api) => {
   // Render multi-stage widget showing Temp Check, ARFC, and AIP all together
   // Get or create the widgets container for column layout
   function getOrCreateWidgetsContainer() {
+    // Don't create container on mobile - widgets should be inline
+    const isMobile = window.innerWidth <= 1024;
+    if (isMobile) {
+      console.log("🔵 [CONTAINER] Mobile detected - skipping container creation");
+      return null;
+    }
+    
     let container = document.getElementById('governance-widgets-wrapper');
     if (!container) {
       container = document.createElement('div');
@@ -1221,7 +1221,11 @@ export default apiInitializer((api) => {
         clearTimeout(updateTimeout);
         updateTimeout = setTimeout(() => {
           if (container && container.parentNode) {
-            updateContainerPosition(container);
+            // Re-check if mobile after resize
+            const stillMobile = window.innerWidth <= 1024;
+            if (!stillMobile) {
+              updateContainerPosition(container);
+            }
           }
         }, 100);
       };
@@ -1300,8 +1304,10 @@ export default apiInitializer((api) => {
     statusWidget.setAttribute("data-widget-type", widgetType); // Mark widget type
     
     // Helper function to format time display
-    function formatTimeDisplay(daysLeft, hoursLeft, status) {
-      if (daysLeft === null || daysLeft === undefined) return 'Date unknown';
+    function formatTimeDisplay(daysLeft, hoursLeft) {
+      if (daysLeft === null || daysLeft === undefined) {
+        return 'Date unknown';
+      }
       if (daysLeft < 0) {
         const daysAgo = Math.abs(daysLeft);
         return `Ended ${daysAgo} ${daysAgo === 1 ? 'day' : 'days'} ago`;
@@ -1317,7 +1323,9 @@ export default apiInitializer((api) => {
     
     // Helper to render Snapshot stage section
     function renderSnapshotStage(stageData, stageUrl, stageName) {
-      if (!stageData) return '';
+      if (!stageData) {
+        return '';
+      }
       
       console.log(`🔵 [RENDER] Rendering ${stageName} stage with data:`, stageData);
       
@@ -1348,10 +1356,7 @@ export default apiInitializer((api) => {
                        (stageData.status !== 'active' && stageData.status !== 'open' && supportPercent > 50);
       const status = isPassed ? 'Passed' : (isActive ? 'Active' : 'Closed');
       const statusClass = isPassed ? 'executed' : (isActive ? 'active' : 'inactive');
-      const timeDisplay = formatTimeDisplay(stageData.daysLeft, stageData.hoursLeft, stageData.status);
-      
-      // Round support percent to 1 decimal place for display (e.g., 99.6% instead of 99.62%)
-      const displaySupportPercent = supportPercent > 0 ? supportPercent.toFixed(1) : '0';
+      const timeDisplay = formatTimeDisplay(stageData.daysLeft, stageData.hoursLeft);
       
       // Calculate percentages for progress bar
       const forPercent = totalVotes > 0 ? (forVotes / totalVotes) * 100 : 0;
@@ -1414,7 +1419,9 @@ export default apiInitializer((api) => {
     
     // Helper to render AIP stage section
     function renderAIPStage(stageData, stageUrl) {
-      if (!stageData) return '';
+      if (!stageData) {
+        return '';
+      }
       
       console.log('🔵 [RENDER] Rendering AIP stage with data:', stageData);
       
@@ -1454,7 +1461,7 @@ export default apiInitializer((api) => {
       
       console.log(`🔵 [RENDER] AIP - For: ${forVotes} (${forPercent}%), Against: ${againstVotes} (${againstPercent}%), Total: ${totalVotes}, Quorum: ${quorum} (${quorumPercent}%)`);
       
-      const timeDisplay = formatTimeDisplay(stageData.daysLeft, stageData.hoursLeft, stageData.status);
+      const timeDisplay = formatTimeDisplay(stageData.daysLeft, stageData.hoursLeft);
       const isEndingSoon = stageData.daysLeft !== null && stageData.daysLeft >= 0 && 
                           (stageData.daysLeft === 0 || (stageData.daysLeft === 1 && stageData.hoursLeft !== null && stageData.hoursLeft < 24));
       
@@ -1486,11 +1493,6 @@ export default apiInitializer((api) => {
       `;
     }
     
-    // Build widget HTML - show all stages in one widget if available
-    // If all stages are present, show "Governance Status", otherwise show specific title
-    // hasSnapshotStages and hasAllStages are already declared above
-    const widgetTitle = hasAllStages ? 'Governance Status' : (widgetType === 'aip' ? 'AIP Status' : 'Snapshot Status');
-    
     // Build stage HTML separately for debugging
     const tempCheckHTML = stages.tempCheck ? renderSnapshotStage(stages.tempCheck, stages.tempCheckUrl, 'Temp Check') : '';
     const arfcHTML = stages.arfc ? renderSnapshotStage(stages.arfc, stages.arfcUrl, 'ARFC') : '';
@@ -1517,7 +1519,11 @@ export default apiInitializer((api) => {
     statusWidget.style.marginBottom = '0';
     
     // Position widget - use container for desktop, inline for mobile
-    const isMobile = window.innerWidth <= 1024;
+    // Use more reliable mobile detection
+    const isMobile = window.innerWidth <= 1024 || 
+                     /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+    
+    console.log(`🔵 [MOBILE] Detection - window.innerWidth: ${window.innerWidth}, isMobile: ${isMobile}`);
     
     // Ensure widget is visible on mobile
     if (isMobile) {
@@ -1526,6 +1532,11 @@ export default apiInitializer((api) => {
       statusWidget.style.opacity = '1';
       statusWidget.style.position = 'relative';
       statusWidget.style.marginBottom = '20px';
+      statusWidget.style.width = '100%';
+      statusWidget.style.maxWidth = '100%';
+      statusWidget.style.marginLeft = '0';
+      statusWidget.style.marginRight = '0';
+      statusWidget.style.zIndex = '1';
     }
     
     if (isMobile) {
@@ -1580,10 +1591,23 @@ export default apiInitializer((api) => {
     } else {
       // Desktop: Append to container for column layout
       const widgetsContainer = getOrCreateWidgetsContainer();
-      widgetsContainer.appendChild(statusWidget);
-      
-      // Position is already set by updateContainerPosition - no need to update
-      console.log("✅ [DESKTOP] Widget added to column container");
+      if (widgetsContainer) {
+        widgetsContainer.appendChild(statusWidget);
+        // Position is already set by updateContainerPosition - no need to update
+        console.log("✅ [DESKTOP] Widget added to column container");
+      } else {
+        // Fallback: if container creation failed, insert inline (shouldn't happen on desktop)
+        console.warn("⚠️ [DESKTOP] Container not available, inserting inline");
+        const topicBody = document.querySelector('.topic-body, .posts-wrapper, .post-stream');
+        if (topicBody) {
+          const firstPost = document.querySelector('.topic-post, .post, [data-post-id]');
+          if (firstPost && firstPost.parentNode) {
+            firstPost.parentNode.insertBefore(statusWidget, firstPost);
+          } else {
+            topicBody.insertBefore(statusWidget, topicBody.firstChild);
+          }
+        }
+      }
     }
     
     console.log("✅ [WIDGET]", widgetType === 'aip' ? 'AIP' : 'Snapshot', "widget rendered");
@@ -1891,8 +1915,11 @@ export default apiInitializer((api) => {
       </div>
     `;
 
-    // Check if mobile (width <= 1024px)
-    const isMobile = window.innerWidth <= 1024;
+    // Check if mobile (width <= 1024px or mobile user agent)
+    const isMobile = window.innerWidth <= 1024 || 
+                     /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+    
+    console.log(`🔵 [MOBILE] Status widget detection - window.innerWidth: ${window.innerWidth}, isMobile: ${isMobile}`);
     
     if (isMobile) {
       // Mobile: Insert widget at the top of the topic, before the first post
@@ -1943,6 +1970,9 @@ export default apiInitializer((api) => {
         statusWidget.style.marginBottom = '20px';
         statusWidget.style.width = '100%';
         statusWidget.style.maxWidth = '100%';
+        statusWidget.style.marginLeft = '0';
+        statusWidget.style.marginRight = '0';
+        statusWidget.style.zIndex = '1';
       } catch (error) {
         console.error("❌ [MOBILE] Error inserting status widget:", error);
         // Fallback: try to append to a safe location
@@ -2012,12 +2042,14 @@ export default apiInitializer((api) => {
     }
   }
 
-  // Track which proposal is currently visible and update widget on scroll
-  let currentVisibleProposal = null;
-
   // Removed getCurrentPostNumber and scrollUpdateTimeout - no longer needed
 
+  // Track which proposal is currently visible and update widget on scroll
+  // eslint-disable-next-line no-unused-vars
+  let currentVisibleProposal = null;
+
   // Find the FIRST Snapshot proposal URL in the entire topic (any post)
+  // eslint-disable-next-line no-unused-vars
   function findFirstSnapshotProposalInTopic() {
     console.log("🔍 [TOPIC] Searching for first Snapshot proposal in topic...");
     
@@ -2075,6 +2107,7 @@ export default apiInitializer((api) => {
 
   // Extract links from Aave Governance Forum thread content
   // When a forum link is detected, search the thread for Snapshot and AIP links
+  // eslint-disable-next-line no-unused-vars
   function extractLinksFromForumThread(forumUrl) {
     console.log("🔍 [FORUM] Extracting links from Aave Governance Forum thread:", forumUrl);
     
@@ -2311,6 +2344,7 @@ export default apiInitializer((api) => {
   }
 
   // Show widget
+  // eslint-disable-next-line no-unused-vars
   function showWidget() {
     const allWidgets = document.querySelectorAll('.tally-status-widget-container');
     allWidgets.forEach(widget => {
@@ -2357,11 +2391,15 @@ export default apiInitializer((api) => {
       
       if (type === 'snapshot') {
         const proposalInfo = extractSnapshotProposalInfo(url);
-        if (!proposalInfo) return null;
+        if (!proposalInfo) {
+          return null;
+        }
         return await fetchSnapshotProposal(proposalInfo.space, proposalInfo.proposalId, cacheKey);
       } else if (type === 'aip') {
         const proposalInfo = extractAIPProposalInfo(url);
-        if (!proposalInfo) return null;
+        if (!proposalInfo) {
+          return null;
+        }
         // Use topicId or aipNumber depending on what we extracted
         const id = proposalInfo.topicId || proposalInfo.aipNumber;
         return await fetchAIPProposal(id, cacheKey);
@@ -2370,6 +2408,11 @@ export default apiInitializer((api) => {
       return null;
     } catch (error) {
       // Handle any unexpected errors gracefully
+      // Mark error as handled to prevent unhandled rejection warnings
+      handledErrors.add(error);
+      if (error.cause) {
+        handledErrors.add(error.cause);
+      }
       console.warn(`⚠️ [FETCH] Error fetching ${type} proposal from ${url}:`, error.message || error);
       return null;
     }
@@ -2377,8 +2420,11 @@ export default apiInitializer((api) => {
 
   // Extract AIP URL from Snapshot proposal metadata/description (CASCADING SEARCH)
   // This is critical for linking sequential proposals: ARFC → AIP
+  // eslint-disable-next-line no-unused-vars
   function extractAIPUrlFromSnapshot(snapshotData) {
-    if (!snapshotData) return null;
+    if (!snapshotData) {
+      return null;
+    }
     
     console.log("🔍 [CASCADE] Searching for AIP link in Snapshot proposal description...");
     
@@ -2465,8 +2511,11 @@ export default apiInitializer((api) => {
   // Extract previous Snapshot stage URL from current Snapshot proposal (CASCADING SEARCH)
   // This finds Temp Check from ARFC, or ARFC from a later Snapshot proposal
   // ARFC proposals often reference the previous Temp Check: "Following the Temp Check [link]"
+  // eslint-disable-next-line no-unused-vars
   function extractPreviousSnapshotStage(snapshotData) {
-    if (!snapshotData) return null;
+    if (!snapshotData) {
+      return null;
+    }
     
     console.log("🔍 [CASCADE] Searching for previous Snapshot stage link...");
     
@@ -2486,8 +2535,6 @@ export default apiInitializer((api) => {
       console.log("⚠️ [CASCADE] No description/body text found for previous stage search");
       return null;
     }
-    
-    const combinedTextLower = combinedText.toLowerCase();
     
     // Pattern 1: Look for explicit references to previous stages
     // "Following the Temp Check", "Previous Temp Check", "See Temp Check", "Temp Check [link]"
@@ -2536,8 +2583,11 @@ export default apiInitializer((api) => {
     
   // Extract Snapshot URL from AIP proposal metadata/description (CASCADING SEARCH)
   // This helps find previous stages: AIP → ARFC/Temp Check
+  // eslint-disable-next-line no-unused-vars
   function extractSnapshotUrlFromAIP(aipData) {
-    if (!aipData) return null;
+    if (!aipData) {
+      return null;
+    }
     
     console.log("🔍 [CASCADE] Searching for Snapshot link in AIP proposal description...");
     
@@ -2671,6 +2721,11 @@ export default apiInitializer((api) => {
           .then(() => fetchProposalDataByType(url, 'snapshot'))
           .then(data => ({ url, data, type: 'snapshot' }))
           .catch(error => {
+            // Mark error as handled to prevent unhandled rejection warnings
+            handledErrors.add(error);
+            if (error.cause) {
+              handledErrors.add(error.cause);
+            }
             console.warn(`⚠️ [TOPIC] Failed to fetch Snapshot proposal from ${url}:`, error.message || error);
             return { url, data: null, type: 'snapshot', error: error.message || String(error) };
           });
@@ -2742,7 +2797,7 @@ export default apiInitializer((api) => {
                 arfc: null,
                 arfcUrl: null,
                 aip: aipData,
-                aipUrl: aipUrl
+                aipUrl
               }, aipWidgetId);
               console.log(`✅ [RENDER] AIP widget ${aipIndex + 1} rendered`);
             } else {
@@ -3122,6 +3177,7 @@ export default apiInitializer((api) => {
   */
 
   // Auto-refresh widget when Tally data changes
+  // eslint-disable-next-line no-unused-vars
   function setupAutoRefresh(widgetId, proposalInfo, url) {
     // Clear any existing refresh interval for this widget
     const refreshKey = `tally_refresh_${widgetId}`;

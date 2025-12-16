@@ -69,6 +69,22 @@
     z-index: 500 !important; // Lower than scroll numbers
     max-height: calc(100vh - 100px) !important;
     overflow-y: auto !important;
+    
+    // Mobile: Override fixed positioning to show inline
+    @media (width <= 1024px) {
+      position: relative !important;
+      left: auto !important;
+      right: auto !important;
+      top: auto !important;
+      width: 100% !important;
+      max-width: 100% !important;
+      max-height: none !important;
+      overflow-y: visible !important;
+      display: block !important;
+      visibility: visible !important;
+      opacity: 1 !important;
+      margin-bottom: 20px !important;
+    }
   }
 
   // Position will be set dynamically by JavaScript relative to timeline
